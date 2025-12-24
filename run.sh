@@ -58,7 +58,7 @@ fi
 
 # Activate virtual environment and install dependencies
 source venv/bin/activate
-pip install -q -r requirements.txt
+pip install --quiet --disable-pip-version-check -r requirements.txt
 
 echo -e "${GREEN}Backend dependencies installed.${NC}"
 

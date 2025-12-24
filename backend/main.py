@@ -14,6 +14,11 @@ from models import (
     StatsResponse,
     ContractorCategory,
     DEFAULT_LOCATIONS,
+    EnrichmentJobCreate,
+    EnrichmentJobResponse,
+    CSVImportRequest,
+    CSVImportResponse,
+    EnrichmentStatsResponse,
 )
 from database import (
     init_database,
@@ -29,8 +34,16 @@ from database import (
     update_job_status,
     cleanup_orphaned_jobs,
     cleanup_duplicate_contractors,
+    # Enrichment functions
+    get_contractors_for_enrichment,
+    create_enrichment_job,
+    get_enrichment_job,
+    get_enrichment_jobs,
+    update_enrichment_job,
+    import_contractors_from_csv,
+    get_enrichment_stats,
 )
-from tasks import job_manager
+from tasks import job_manager, enrichment_manager
 from models import JobStatus
 import logging
 
@@ -101,8 +114,8 @@ async def get_db_locations():
 
 @app.post("/api/cleanup-location")
 async def cleanup_by_location(
-    keep_states: Optional[List[str]] = None,
-    remove_states: Optional[List[str]] = None,
+    keep_states: Optional[List[str]] = Query(default=None),
+    remove_states: Optional[List[str]] = Query(default=None),
 ):
     """Remove contractors from specific states or keep only certain states."""
     if not keep_states and not remove_states:
@@ -297,6 +310,150 @@ def _format_job_response(job: dict) -> JobResponse:
         created_at=job["created_at"] or "",
         completed_at=job["completed_at"],
     )
+
+
+def _format_enrichment_job_response(job: dict) -> EnrichmentJobResponse:
+    return EnrichmentJobResponse(
+        id=job["id"],
+        status=job["status"],
+        total_records=job["total_records"],
+        processed=job["processed"],
+        enriched=job["enriched"],
+        failed=job["failed"],
+        current_business=job["current_business"],
+        error_message=job["error_message"],
+        source=job["source"],
+        created_at=job["created_at"] or "",
+        completed_at=job["completed_at"],
+    )
+
+
+# ==================== ENRICHMENT ENDPOINTS ====================
+
+@app.get("/api/enrichment/stats", response_model=EnrichmentStatsResponse)
+async def get_enrichment_statistics():
+    """Get enrichment-specific statistics."""
+    stats = get_enrichment_stats()
+    return EnrichmentStatsResponse(**stats)
+
+
+@app.post("/api/enrich", response_model=EnrichmentJobResponse)
+async def start_enrichment_job(job_data: EnrichmentJobCreate):
+    """Start an enrichment job for contractors in the database."""
+    # Get contractors that need enrichment
+    contractors = get_contractors_for_enrichment(
+        only_missing=job_data.only_missing,
+        category=job_data.category,
+        state=job_data.state,
+        limit=job_data.limit
+    )
+
+    if not contractors:
+        raise HTTPException(status_code=400, detail="No contractors found matching criteria")
+
+    # Create enrichment job
+    job_id = create_enrichment_job(total_records=len(contractors), source="database")
+
+    # Start enrichment in background
+    thread_count = max(1, min(5, job_data.thread_count))
+    enrichment_manager.start_enrichment_job(job_id, contractors, thread_count)
+
+    job = get_enrichment_job(job_id)
+    return _format_enrichment_job_response(job)
+
+
+@app.get("/api/enrich", response_model=List[EnrichmentJobResponse])
+async def list_enrichment_jobs(limit: int = Query(default=20, ge=1, le=100)):
+    """List recent enrichment jobs."""
+    jobs = get_enrichment_jobs(limit)
+    return [_format_enrichment_job_response(job) for job in jobs]
+
+
+@app.get("/api/enrich/{job_id}", response_model=EnrichmentJobResponse)
+async def get_enrichment_job_status(job_id: int):
+    """Get enrichment job status."""
+    job = get_enrichment_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Enrichment job not found")
+    return _format_enrichment_job_response(job)
+
+
+@app.delete("/api/enrich/{job_id}")
+async def cancel_enrichment_job(job_id: int):
+    """Cancel an enrichment job."""
+    job = get_enrichment_job(job_id)
+    if not job:
+        raise HTTPException(status_code=404, detail="Enrichment job not found")
+
+    if job["status"] == JobStatus.RUNNING.value:
+        enrichment_manager.stop_job(job_id)
+        return {"message": "Enrichment job cancelled"}
+    elif job["status"] == JobStatus.PENDING.value:
+        update_enrichment_job(job_id, status=JobStatus.CANCELLED)
+        return {"message": "Enrichment job cancelled"}
+    else:
+        return {"message": "Enrichment job already finished"}
+
+
+@app.post("/api/import-csv", response_model=CSVImportResponse)
+async def import_csv(request: CSVImportRequest):
+    """Import contractors from CSV data."""
+    if not request.contractors:
+        raise HTTPException(status_code=400, detail="No contractors provided")
+
+    # Import contractors
+    imported, merged = import_contractors_from_csv(request.contractors)
+
+    response = CSVImportResponse(
+        imported=imported,
+        merged=merged,
+        total=len(request.contractors)
+    )
+
+    # Optionally start enrichment after import
+    if request.enrich_after and imported > 0:
+        # Get the newly imported contractors that need enrichment
+        contractors = get_contractors_for_enrichment(only_missing=True, limit=imported + merged)
+
+        if contractors:
+            job_id = create_enrichment_job(total_records=len(contractors), source="csv_import")
+            thread_count = max(1, min(5, request.thread_count))
+            enrichment_manager.start_enrichment_job(job_id, contractors, thread_count)
+            response.enrichment_job_id = job_id
+
+    return response
+
+
+@app.get("/api/enrichment/preview")
+async def preview_enrichment(
+    category: Optional[str] = None,
+    state: Optional[str] = None,
+    limit: int = Query(default=100, ge=1, le=500),
+    only_missing: bool = True
+):
+    """Preview contractors that would be enriched."""
+    contractors = get_contractors_for_enrichment(
+        only_missing=only_missing,
+        category=category,
+        state=state,
+        limit=limit
+    )
+
+    return {
+        "count": len(contractors),
+        "preview": [
+            {
+                "id": c["id"],
+                "name": c["name"],
+                "city": c.get("city"),
+                "state": c.get("state"),
+                "has_owner": bool(c.get("owner_name")),
+                "has_email": bool(c.get("email")),
+                "has_phone": bool(c.get("phone")),
+            }
+            for c in contractors[:20]  # Only return first 20 for preview
+        ]
+    }
 
 
 if __name__ == "__main__":

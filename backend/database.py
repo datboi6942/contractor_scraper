@@ -90,12 +90,39 @@ def init_database():
             )
         """)
 
-        # Migration: Add owner_name column if it doesn't exist
+        # Create enrichment jobs table
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS enrichment_jobs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                status TEXT DEFAULT 'pending',
+                total_records INTEGER DEFAULT 0,
+                processed INTEGER DEFAULT 0,
+                enriched INTEGER DEFAULT 0,
+                failed INTEGER DEFAULT 0,
+                current_business TEXT,
+                error_message TEXT,
+                source TEXT DEFAULT 'database',
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                completed_at TIMESTAMP
+            )
+        """)
+
+        # Migration: Add new columns if they don't exist
         cursor.execute("PRAGMA table_info(contractors)")
         columns = [col[1] for col in cursor.fetchall()]
-        if 'owner_name' not in columns:
-            cursor.execute("ALTER TABLE contractors ADD COLUMN owner_name TEXT")
-            logger.info("Added owner_name column to contractors table")
+
+        migrations = [
+            ('owner_name', 'TEXT'),
+            ('linkedin_url', 'TEXT'),
+            ('enriched', 'INTEGER DEFAULT 0'),
+            ('enrichment_confidence', 'REAL DEFAULT 0'),
+            ('enriched_at', 'TIMESTAMP'),
+        ]
+
+        for col_name, col_type in migrations:
+            if col_name not in columns:
+                cursor.execute(f"ALTER TABLE contractors ADD COLUMN {col_name} {col_type}")
+                logger.info(f"Added {col_name} column to contractors table")
 
         # Migration: Remove old UNIQUE constraint by recreating table
         # Check if old constraint exists
@@ -657,3 +684,231 @@ def cleanup_duplicate_contractors() -> Tuple[int, int]:
             if to_delete:
                 logger.info(f"CLEANUP COMPLETE: Removed {len(to_delete)} duplicates, updated {updates_made} records")
             return len(to_delete), updates_made
+
+
+# ==================== ENRICHMENT FUNCTIONS ====================
+
+def get_contractors_for_enrichment(
+    only_missing: bool = True,
+    category: Optional[str] = None,
+    state: Optional[str] = None,
+    limit: Optional[int] = None
+) -> List[dict]:
+    """Get contractors that need enrichment."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+
+        where_clauses = []
+        params = []
+
+        if only_missing:
+            # Only get records missing owner_name OR email
+            where_clauses.append("(owner_name IS NULL OR owner_name = '' OR email IS NULL OR email = '')")
+
+        if category:
+            where_clauses.append("category = ?")
+            params.append(category)
+
+        if state:
+            where_clauses.append("UPPER(state) = ?")
+            params.append(state.upper())
+
+        where_sql = ""
+        if where_clauses:
+            where_sql = "WHERE " + " AND ".join(where_clauses)
+
+        limit_sql = ""
+        if limit:
+            limit_sql = f"LIMIT {limit}"
+
+        cursor.execute(f"""
+            SELECT * FROM contractors {where_sql}
+            ORDER BY created_at DESC {limit_sql}
+        """, params)
+
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def update_contractor_enrichment(
+    contractor_id: int,
+    owner_name: Optional[str] = None,
+    email: Optional[str] = None,
+    linkedin_url: Optional[str] = None,
+    confidence: float = 0.0
+):
+    """Update contractor with enrichment data."""
+    with _lock:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+
+            updates = ["enriched = 1", "enriched_at = ?", "enrichment_confidence = ?"]
+            params = [datetime.now().isoformat(), confidence]
+
+            if owner_name:
+                updates.append("owner_name = ?")
+                params.append(owner_name)
+
+            if email:
+                updates.append("email = ?")
+                params.append(email)
+
+            if linkedin_url:
+                updates.append("linkedin_url = ?")
+                params.append(linkedin_url)
+
+            params.append(contractor_id)
+
+            cursor.execute(f"""
+                UPDATE contractors SET {", ".join(updates)} WHERE id = ?
+            """, params)
+            conn.commit()
+
+
+def create_enrichment_job(total_records: int, source: str = "database") -> int:
+    """Create a new enrichment job."""
+    with _lock:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO enrichment_jobs (status, total_records, source)
+                VALUES (?, ?, ?)
+            """, (JobStatus.PENDING.value, total_records, source))
+            conn.commit()
+            return cursor.lastrowid
+
+
+def get_enrichment_job(job_id: int) -> Optional[dict]:
+    """Get enrichment job by ID."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM enrichment_jobs WHERE id = ?", (job_id,))
+        row = cursor.fetchone()
+        return dict(row) if row else None
+
+
+def get_enrichment_jobs(limit: int = 20) -> List[dict]:
+    """Get recent enrichment jobs."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM enrichment_jobs ORDER BY created_at DESC LIMIT ?
+        """, (limit,))
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def update_enrichment_job(
+    job_id: int,
+    status: Optional[JobStatus] = None,
+    processed: Optional[int] = None,
+    enriched: Optional[int] = None,
+    failed: Optional[int] = None,
+    current_business: Optional[str] = None,
+    error_message: Optional[str] = None
+):
+    """Update enrichment job status."""
+    with _lock:
+        with get_connection() as conn:
+            cursor = conn.cursor()
+
+            updates = []
+            params = []
+
+            if status is not None:
+                updates.append("status = ?")
+                params.append(status.value)
+                if status in [JobStatus.COMPLETED, JobStatus.FAILED, JobStatus.CANCELLED]:
+                    updates.append("completed_at = ?")
+                    params.append(datetime.now().isoformat())
+
+            if processed is not None:
+                updates.append("processed = ?")
+                params.append(processed)
+
+            if enriched is not None:
+                updates.append("enriched = ?")
+                params.append(enriched)
+
+            if failed is not None:
+                updates.append("failed = ?")
+                params.append(failed)
+
+            if current_business is not None:
+                updates.append("current_business = ?")
+                params.append(current_business)
+
+            if error_message is not None:
+                updates.append("error_message = ?")
+                params.append(error_message)
+
+            if updates:
+                params.append(job_id)
+                cursor.execute(f"""
+                    UPDATE enrichment_jobs SET {", ".join(updates)} WHERE id = ?
+                """, params)
+                conn.commit()
+
+
+def import_contractors_from_csv(contractors: List[dict], source: str = "csv_import") -> Tuple[int, int]:
+    """Import contractors from CSV data.
+
+    Returns (imported, merged) tuple.
+    """
+    imported = 0
+    merged = 0
+
+    for c in contractors:
+        contractor = Contractor(
+            name=c.get('name', c.get('business_name', c.get('Business Name', ''))),
+            owner_name=c.get('owner_name', c.get('owner', c.get('Owner', c.get('Owner/Contact', '')))),
+            category=c.get('category', c.get('Category', 'general_contractor')),
+            address=c.get('address', c.get('Address', '')),
+            city=c.get('city', c.get('City', '')),
+            state=c.get('state', c.get('State', '')),
+            zip_code=c.get('zip_code', c.get('Zip Code', c.get('zip', ''))),
+            phone=c.get('phone', c.get('Phone', '')),
+            email=c.get('email', c.get('Email', '')),
+            website=c.get('website', c.get('Website', '')),
+            source=source,
+            location_searched=c.get('location_searched', c.get('city', 'CSV Import'))
+        )
+
+        result = add_contractor(contractor)
+        if result is not None:
+            imported += 1
+        else:
+            merged += 1
+
+    return imported, merged
+
+
+def get_enrichment_stats() -> dict:
+    """Get enrichment-specific statistics."""
+    with get_connection() as conn:
+        cursor = conn.cursor()
+
+        cursor.execute("SELECT COUNT(*) FROM contractors WHERE enriched = 1")
+        total_enriched = cursor.fetchone()[0]
+
+        cursor.execute("SELECT COUNT(*) FROM contractors WHERE linkedin_url IS NOT NULL AND linkedin_url != ''")
+        with_linkedin = cursor.fetchone()[0]
+
+        cursor.execute("""
+            SELECT COUNT(*) FROM contractors
+            WHERE (owner_name IS NULL OR owner_name = '')
+            AND (email IS NULL OR email = '')
+        """)
+        needs_enrichment = cursor.fetchone()[0]
+
+        cursor.execute("SELECT AVG(enrichment_confidence) FROM contractors WHERE enriched = 1")
+        avg_confidence = cursor.fetchone()[0] or 0
+
+        cursor.execute("SELECT COUNT(*) FROM enrichment_jobs WHERE status = ?", (JobStatus.RUNNING.value,))
+        active_enrichment_jobs = cursor.fetchone()[0]
+
+        return {
+            "total_enriched": total_enriched,
+            "with_linkedin": with_linkedin,
+            "needs_enrichment": needs_enrichment,
+            "avg_confidence": round(avg_confidence, 2),
+            "active_enrichment_jobs": active_enrichment_jobs
+        }

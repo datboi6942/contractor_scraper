@@ -3,6 +3,7 @@ import Dashboard from './components/Dashboard'
 import JobConfig from './components/JobConfig'
 import DataTable from './components/DataTable'
 import JobStatus from './components/JobStatus'
+import Enrich from './components/Enrich'
 
 const API_BASE = 'http://localhost:8002/api'
 
@@ -154,6 +155,8 @@ function App() {
         )
       case 'jobs':
         return <JobStatus jobs={jobs} onCancel={handleCancelJob} />
+      case 'enrich':
+        return <Enrich categories={categories} />
       case 'data':
         return <DataTable categories={categories} />
       default:
@@ -175,6 +178,7 @@ function App() {
           { id: 'dashboard', label: 'Dashboard' },
           { id: 'new-job', label: 'New Scraping Job' },
           { id: 'jobs', label: 'Job Status' },
+          { id: 'enrich', label: 'Enrich Leads' },
           { id: 'data', label: 'Collected Data' },
         ].map((tab) => (
           <button
