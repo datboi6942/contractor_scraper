@@ -1,0 +1,4 @@
+.env
+backend/venv
+backend/contractors.db
+backend/__pycache__
