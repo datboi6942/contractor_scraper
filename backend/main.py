@@ -1,10 +1,18 @@
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request, WebSocket, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from typing import Optional, List
 import csv
 import io
+import asyncio
+
+# Rate limiting to protect API endpoints
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
+limiter = Limiter(key_func=get_remote_address)
 
 from models import (
     JobCreate,
@@ -40,10 +48,13 @@ from database import (
     get_enrichment_job,
     get_enrichment_jobs,
     update_enrichment_job,
+    update_enrichment_job,
     import_contractors_from_csv,
     get_enrichment_stats,
+    get_contractors_for_enrichment,
 )
 from tasks import job_manager, enrichment_manager
+from ws_manager import manager
 from models import JobStatus
 import logging
 
@@ -80,6 +91,10 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan
 )
+
+# Add rate limiter to app state and exception handler
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 app.add_middleware(
     CORSMiddleware,
@@ -151,7 +166,8 @@ async def get_categories():
 
 
 @app.post("/api/jobs", response_model=JobResponse)
-async def create_scraping_job(job_data: JobCreate):
+@limiter.limit("3/minute")  # Limit scraping jobs to protect from abuse
+async def create_scraping_job(request: Request, job_data: JobCreate):
     if not job_data.categories:
         raise HTTPException(status_code=400, detail="At least one category is required")
 
@@ -218,9 +234,13 @@ async def list_contractors(
             phone=c["phone"],
             email=c["email"],
             website=c["website"],
+            linkedin_url=c.get("linkedin_url"),
             source=c["source"],
             location_searched=c["location_searched"],
+            enriched=bool(c.get("enriched", 0)),
+            enrichment_confidence=float(c.get("enrichment_confidence", 0) or 0),
             created_at=c["created_at"] or "",
+            enriched_at=c.get("enriched_at"),
         )
         for c in contractors
     ]
@@ -338,7 +358,8 @@ async def get_enrichment_statistics():
 
 
 @app.post("/api/enrich", response_model=EnrichmentJobResponse)
-async def start_enrichment_job(job_data: EnrichmentJobCreate):
+@limiter.limit("5/minute")  # Protect OpenAI credits - max 5 enrichment jobs per minute per IP
+async def start_enrichment_job(request: Request, job_data: EnrichmentJobCreate):
     """Start an enrichment job for contractors in the database."""
     # Get contractors that need enrichment
     contractors = get_contractors_for_enrichment(
@@ -396,28 +417,29 @@ async def cancel_enrichment_job(job_id: int):
 
 
 @app.post("/api/import-csv", response_model=CSVImportResponse)
-async def import_csv(request: CSVImportRequest):
+@limiter.limit("10/minute")  # Limit CSV imports
+async def import_csv(request: Request, csv_request: CSVImportRequest):
     """Import contractors from CSV data."""
-    if not request.contractors:
+    if not csv_request.contractors:
         raise HTTPException(status_code=400, detail="No contractors provided")
 
     # Import contractors
-    imported, merged = import_contractors_from_csv(request.contractors)
+    imported, merged = import_contractors_from_csv(csv_request.contractors)
 
     response = CSVImportResponse(
         imported=imported,
         merged=merged,
-        total=len(request.contractors)
+        total=len(csv_request.contractors)
     )
 
     # Optionally start enrichment after import
-    if request.enrich_after and imported > 0:
+    if csv_request.enrich_after and imported > 0:
         # Get the newly imported contractors that need enrichment
         contractors = get_contractors_for_enrichment(only_missing=True, limit=imported + merged)
 
         if contractors:
             job_id = create_enrichment_job(total_records=len(contractors), source="csv_import")
-            thread_count = max(1, min(5, request.thread_count))
+            thread_count = max(1, min(5, csv_request.thread_count))
             enrichment_manager.start_enrichment_job(job_id, contractors, thread_count)
             response.enrichment_job_id = job_id
 
@@ -454,6 +476,42 @@ async def preview_enrichment(
             for c in contractors[:20]  # Only return first 20 for preview
         ]
     }
+
+
+@app.get("/api/enrichment/sample")
+async def get_enrichment_sample(limit: int = Query(default=10, ge=1, le=50)):
+    """Return recently enriched contractors for preview."""
+    # We'll use get_contractors with a filter for enriched=1
+    # Since get_contractors doesn't support 'enriched' filter directly in its args yet,
+    # we can use get_contractors_for_enrichment(only_missing=False) and filter manually or add a new DB function.
+    # For now, let's just get the latest enriched contractors.
+    from database import get_connection
+    with get_connection() as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            SELECT * FROM contractors 
+            WHERE enriched = 1 
+            ORDER BY enriched_at DESC 
+            LIMIT ?
+        """, (limit,))
+        rows = cursor.fetchall()
+        return [dict(row) for row in rows]
+
+
+@app.websocket("/ws/enrich/{job_id}")
+async def websocket_enrichment(websocket: WebSocket, job_id: int):
+    """WebSocket endpoint for real-time enrichment progress."""
+    await manager.connect(job_id, websocket)
+    try:
+        # Keep connection open until client disconnects
+        while True:
+            # We don't expect messages from client, but we need to wait to keep connection alive
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(job_id, websocket)
+    except Exception as e:
+        logger.error(f"WebSocket error for job {job_id}: {e}")
+        manager.disconnect(job_id, websocket)
 
 
 if __name__ == "__main__":

@@ -12,6 +12,8 @@ from database import (
     update_contractor_enrichment,
     get_contractors_for_enrichment,
 )
+from ws_manager import manager
+import asyncio
 
 logging.basicConfig(
     level=logging.INFO,
@@ -230,6 +232,22 @@ class EnrichmentJobManager:
                     enriched=enriched,
                     failed=failed
                 )
+                # Broadcast progress via WebSocket
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(manager.broadcast(job_id, {
+                        "type": "progress",
+                        "job_id": job_id,
+                        "processed": processed,
+                        "total": total,
+                        "enriched": enriched,
+                        "failed": failed,
+                        "status": "running"
+                    }))
+                    loop.close()
+                except Exception as e:
+                    logger.error(f"WebSocket broadcast error: {e}")
 
             def on_result(contractor: dict, result):
                 nonlocal enriched, failed
@@ -240,10 +258,12 @@ class EnrichmentJobManager:
                         owner_name=result.owner_name,
                         email=result.email,
                         linkedin_url=result.linkedin_url,
-                        confidence=result.confidence
+                        confidence=result.confidence,
+                        source_urls=result.source_urls  # Track where data came from
                     )
                     enriched += 1
-                    logger.info(f"[Enrich {job_id}] ENRICHED: {contractor['name']}")
+                    sources = f" (from {len(result.source_urls)} sources)" if result.source_urls else ""
+                    logger.info(f"[Enrich {job_id}] ENRICHED: {contractor['name']}{sources}")
                 else:
                     failed += 1
 
@@ -253,6 +273,23 @@ class EnrichmentJobManager:
                     enriched=enriched,
                     failed=failed
                 )
+                
+                # Broadcast result via WebSocket
+                try:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                    loop.run_until_complete(manager.broadcast(job_id, {
+                        "type": "result",
+                        "job_id": job_id,
+                        "contractor": contractor['name'],
+                        "success": result.success,
+                        "enriched": enriched,
+                        "failed": failed,
+                        "processed": processed
+                    }))
+                    loop.close()
+                except Exception as e:
+                    logger.error(f"WebSocket broadcast error: {e}")
 
             # Set should_stop on enricher
             enricher._should_stop = should_stop
@@ -273,6 +310,7 @@ class EnrichmentJobManager:
                     failed=failed
                 )
                 logger.info(f"[Enrich {job_id}] CANCELLED. Enriched {enriched} before stopping.")
+                status = "cancelled"
             else:
                 update_enrichment_job(
                     job_id,
@@ -282,6 +320,23 @@ class EnrichmentJobManager:
                     failed=failed
                 )
                 logger.info(f"[Enrich {job_id}] COMPLETED. Enriched: {enriched}, Failed: {failed}")
+                status = "completed"
+
+            # Broadcast final status
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(manager.broadcast(job_id, {
+                    "type": "status",
+                    "job_id": job_id,
+                    "status": status,
+                    "processed": processed,
+                    "enriched": enriched,
+                    "failed": failed
+                }))
+                loop.close()
+            except Exception as e:
+                logger.error(f"WebSocket broadcast error: {e}")
 
         except Exception as e:
             logger.error(f"[Enrich {job_id}] FAILED with error: {e}", exc_info=True)
@@ -293,6 +348,20 @@ class EnrichmentJobManager:
                 enriched=enriched,
                 failed=failed
             )
+            
+            # Broadcast failure
+            try:
+                loop = asyncio.new_event_loop()
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(manager.broadcast(job_id, {
+                    "type": "status",
+                    "job_id": job_id,
+                    "status": "failed",
+                    "error": str(e)
+                }))
+                loop.close()
+            except Exception as ex:
+                logger.error(f"WebSocket broadcast error: {ex}")
 
         finally:
             if enricher:

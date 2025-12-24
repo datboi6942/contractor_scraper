@@ -1,6 +1,7 @@
 import React, { useState, useEffect } from 'react'
 import CSVUpload from './CSVUpload'
 import EnrichmentStatus from './EnrichmentStatus'
+import EnrichedPreview from './EnrichedPreview'
 
 const API_BASE = 'http://localhost:8002/api'
 
@@ -175,6 +176,15 @@ function Enrich({ categories }) {
         >
           Import CSV
         </button>
+        <button
+          style={{
+            ...styles.tab,
+            ...(activeSubTab === 'preview' ? styles.activeTab : {})
+          }}
+          onClick={() => setActiveSubTab('preview')}
+        >
+          Preview Enriched Leads
+        </button>
       </div>
 
       {activeSubTab === 'enrich' && (
@@ -186,6 +196,10 @@ function Enrich({ categories }) {
 
       {activeSubTab === 'import' && (
         <CSVUpload onImportComplete={handleImportComplete} />
+      )}
+
+      {activeSubTab === 'preview' && (
+        <EnrichedPreview />
       )}
     </div>
   )

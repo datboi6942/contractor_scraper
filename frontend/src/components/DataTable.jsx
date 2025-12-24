@@ -80,6 +80,38 @@ const styles = {
     color: '#667eea',
     textDecoration: 'none',
   },
+  enrichedBadge: {
+    display: 'inline-block',
+    padding: '2px 6px',
+    fontSize: '10px',
+    fontWeight: '600',
+    borderRadius: '10px',
+    backgroundColor: '#e3f2fd',
+    color: '#1565c0',
+    marginLeft: '5px',
+  },
+  confidenceBadge: {
+    display: 'inline-block',
+    padding: '2px 6px',
+    fontSize: '10px',
+    borderRadius: '4px',
+    marginLeft: '4px',
+  },
+  linkedinIcon: {
+    display: 'inline-block',
+    padding: '2px 6px',
+    fontSize: '10px',
+    fontWeight: '600',
+    borderRadius: '4px',
+    backgroundColor: '#0077b5',
+    color: 'white',
+    textDecoration: 'none',
+    marginLeft: '5px',
+  },
+  enrichedCell: {
+    backgroundColor: '#e8f5e9',
+    borderLeft: '3px solid #4caf50',
+  },
 }
 
 function DataTable({ categories }) {
@@ -412,57 +444,95 @@ function DataTable({ categories }) {
                   <th style={styles.th}>Phone</th>
                   <th style={styles.th}>Email</th>
                   <th style={styles.th}>Address</th>
-                  <th style={styles.th}>Website</th>
+                  <th style={styles.th}>Links</th>
                 </tr>
               </thead>
               <tbody>
-                {contractors.map((c) => (
-                  <tr key={c.id}>
-                    <td style={styles.td} title={c.name}>
-                      {c.name}
-                    </td>
-                    <td style={{
-                      ...styles.td,
-                      backgroundColor: c.owner_name ? '#e8f5e9' : '#fff3e0',
-                      fontWeight: c.owner_name ? '600' : 'normal',
-                      color: c.owner_name ? '#2e7d32' : '#e65100',
-                    }}>
-                      {c.owner_name || '—'}
-                    </td>
-                    <td style={styles.td}>
-                      {c.category.replace(/_/g, ' ')}
-                    </td>
-                    <td style={styles.td}>
-                      {c.phone && (
-                        <a href={`tel:${c.phone}`} style={styles.link}>
-                          {c.phone}
-                        </a>
-                      )}
-                    </td>
-                    <td style={styles.td}>
-                      {c.email && (
-                        <a href={`mailto:${c.email}`} style={styles.link}>
-                          {c.email}
-                        </a>
-                      )}
-                    </td>
-                    <td style={styles.td} title={`${c.address || ''} ${c.city || ''} ${c.state || ''} ${c.zip_code || ''}`}>
-                      {[c.city, c.state].filter(Boolean).join(', ')}
-                    </td>
-                    <td style={styles.td}>
-                      {c.website && (
-                        <a
-                          href={c.website}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          style={styles.link}
-                        >
-                          Visit
-                        </a>
-                      )}
-                    </td>
-                  </tr>
-                ))}
+                {contractors.map((c) => {
+                  const isEnriched = c.enriched;
+                  const confidence = c.enrichment_confidence || 0;
+                  const confidenceColor = confidence > 0.7 ? '#4caf50' : confidence > 0.4 ? '#ff9800' : '#f44336';
+
+                  return (
+                    <tr key={c.id} style={isEnriched ? { backgroundColor: '#fafffe' } : {}}>
+                      <td style={styles.td} title={c.name}>
+                        {c.name}
+                        {isEnriched && (
+                          <span style={styles.enrichedBadge} title={`AI Enriched (${Math.round(confidence * 100)}% confidence)`}>
+                            AI
+                          </span>
+                        )}
+                      </td>
+                      <td style={{
+                        ...styles.td,
+                        ...(isEnriched && c.owner_name ? styles.enrichedCell : {}),
+                        backgroundColor: c.owner_name ? '#e8f5e9' : '#fff3e0',
+                        fontWeight: c.owner_name ? '600' : 'normal',
+                        color: c.owner_name ? '#2e7d32' : '#e65100',
+                      }}>
+                        {c.owner_name || '—'}
+                        {isEnriched && confidence > 0 && (
+                          <span
+                            style={{
+                              ...styles.confidenceBadge,
+                              backgroundColor: confidenceColor + '20',
+                              color: confidenceColor,
+                            }}
+                            title={`${Math.round(confidence * 100)}% confidence`}
+                          >
+                            {Math.round(confidence * 100)}%
+                          </span>
+                        )}
+                      </td>
+                      <td style={styles.td}>
+                        {c.category.replace(/_/g, ' ')}
+                      </td>
+                      <td style={styles.td}>
+                        {c.phone && (
+                          <a href={`tel:${c.phone}`} style={styles.link}>
+                            {c.phone}
+                          </a>
+                        )}
+                      </td>
+                      <td style={{
+                        ...styles.td,
+                        ...(isEnriched && c.email ? styles.enrichedCell : {}),
+                      }}>
+                        {c.email && (
+                          <a href={`mailto:${c.email}`} style={styles.link}>
+                            {c.email}
+                          </a>
+                        )}
+                      </td>
+                      <td style={styles.td} title={`${c.address || ''} ${c.city || ''} ${c.state || ''} ${c.zip_code || ''}`}>
+                        {[c.city, c.state].filter(Boolean).join(', ')}
+                      </td>
+                      <td style={styles.td}>
+                        {c.website && (
+                          <a
+                            href={c.website}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={styles.link}
+                          >
+                            Web
+                          </a>
+                        )}
+                        {c.linkedin_url && (
+                          <a
+                            href={c.linkedin_url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            style={styles.linkedinIcon}
+                            title="View LinkedIn Profile"
+                          >
+                            in
+                          </a>
+                        )}
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           </div>

@@ -117,6 +117,7 @@ def init_database():
             ('enriched', 'INTEGER DEFAULT 0'),
             ('enrichment_confidence', 'REAL DEFAULT 0'),
             ('enriched_at', 'TIMESTAMP'),
+            ('enrichment_source_urls', 'TEXT'),  # JSON array of source URLs
         ]
 
         for col_name, col_type in migrations:
@@ -734,9 +735,10 @@ def update_contractor_enrichment(
     owner_name: Optional[str] = None,
     email: Optional[str] = None,
     linkedin_url: Optional[str] = None,
-    confidence: float = 0.0
+    confidence: float = 0.0,
+    source_urls: Optional[List[str]] = None
 ):
-    """Update contractor with enrichment data."""
+    """Update contractor with enrichment data including source URLs for verification."""
     with _lock:
         with get_connection() as conn:
             cursor = conn.cursor()
@@ -755,6 +757,12 @@ def update_contractor_enrichment(
             if linkedin_url:
                 updates.append("linkedin_url = ?")
                 params.append(linkedin_url)
+
+            # Store source URLs as JSON for verification/audit trail
+            if source_urls:
+                import json
+                updates.append("enrichment_source_urls = ?")
+                params.append(json.dumps(source_urls[:5]))  # Keep top 5 sources
 
             params.append(contractor_id)
 

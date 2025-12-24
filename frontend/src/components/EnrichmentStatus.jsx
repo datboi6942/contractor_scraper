@@ -1,6 +1,7 @@
-import React, { useState, useEffect } from 'react'
+import React, { useState, useEffect, useRef } from 'react'
 
 const API_BASE = 'http://localhost:8002/api'
+const WS_BASE = 'ws://localhost:8002/ws'
 
 const styles = {
   container: {
@@ -205,6 +206,7 @@ function EnrichmentStatus({ categories, onRefresh }) {
   const [jobs, setJobs] = useState([])
   const [preview, setPreview] = useState(null)
   const [isStarting, setIsStarting] = useState(false)
+  const wsConnections = useRef({})
   const [filter, setFilter] = useState({
     category: '',
     state: '',
@@ -242,12 +244,65 @@ function EnrichmentStatus({ categories, onRefresh }) {
     fetchJobs()
     fetchPreview()
 
+    // We still keep a slow poll just in case WebSocket misses something 
+    // or to discover new jobs started by other tabs
     const interval = setInterval(() => {
       fetchJobs()
-    }, 3000)
+    }, 10000)
 
-    return () => clearInterval(interval)
+    return () => {
+      clearInterval(interval)
+      // Close all WebSockets on unmount
+      Object.values(wsConnections.current).forEach(ws => ws.close())
+    }
   }, [])
+
+  // Manage WebSocket connections for running jobs
+  useEffect(() => {
+    const runningJobs = jobs.filter(j => j.status === 'running')
+    
+    runningJobs.forEach(job => {
+      if (!wsConnections.current[job.id]) {
+        console.log(`Connecting WebSocket for job ${job.id}`)
+        const ws = new WebSocket(`${WS_BASE}/enrich/${job.id}`)
+        
+        ws.onmessage = (event) => {
+          const data = JSON.parse(event.data)
+          setJobs(prevJobs => prevJobs.map(j => {
+            if (j.id === data.job_id) {
+              const updatedJob = { ...j }
+              if (data.type === 'progress') {
+                updatedJob.processed = data.processed
+                updatedJob.enriched = data.enriched
+                updatedJob.failed = data.failed
+              } else if (data.type === 'result') {
+                updatedJob.current_business = data.contractor
+                updatedJob.enriched = data.enriched
+                updatedJob.failed = data.failed
+                updatedJob.processed = data.processed
+              } else if (data.type === 'status') {
+                updatedJob.status = data.status
+                if (data.error) updatedJob.error_message = data.error
+              }
+              return updatedJob
+            }
+            return j
+          }))
+          
+          if (data.type === 'status' && (data.status === 'completed' || data.status === 'failed' || data.status === 'cancelled')) {
+            ws.close()
+            if (onRefresh) onRefresh()
+          }
+        }
+        
+        ws.onclose = () => {
+          delete wsConnections.current[job.id]
+        }
+        
+        wsConnections.current[job.id] = ws
+      }
+    })
+  }, [jobs])
 
   useEffect(() => {
     fetchPreview()

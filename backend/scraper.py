@@ -12,6 +12,7 @@ import threading
 from urllib.parse import urlparse, urljoin
 
 from models import Contractor, CATEGORY_SEARCH_TERMS
+from stealth import stealth, get_stealth_context_options, apply_stealth_scripts
 
 logging.basicConfig(
     level=logging.INFO,
@@ -132,22 +133,30 @@ class SmartContractorScraper:
         return False
 
     def _create_browser(self):
-        """Create a new browser instance"""
+        """Create a new browser instance with stealth settings"""
         playwright = sync_playwright().start()
         browser = playwright.chromium.launch(
             headless=True,
-            args=['--disable-blink-features=AutomationControlled', '--no-sandbox', '--disable-dev-shm-usage']
+            args=stealth.get_browser_args()
         )
         return playwright, browser
 
     def _create_page(self, browser):
-        """Create a new page with anti-detection"""
-        context = browser.new_context(
-            viewport={'width': 1920, 'height': 1080},
-            user_agent='Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36',
-        )
-        context.add_init_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
-        return context.new_page()
+        """Create a new page with full anti-detection stealth"""
+        # Get randomized stealth options (viewport, user-agent, proxy, etc.)
+        context_options = get_stealth_context_options()
+        context = browser.new_context(**context_options)
+
+        # Apply all stealth scripts
+        page = context.new_page()
+        apply_stealth_scripts(page)
+
+        # Log stealth config for debugging
+        ua = context_options.get('user_agent', '')[:50]
+        proxy = 'with proxy' if 'proxy' in context_options else 'no proxy'
+        self._log(f"[STEALTH] UA: {ua}... | {proxy}")
+
+        return page
 
     def _extract_urls_from_google(self, page, search_term: str, location: str) -> List[dict]:
         """Search Google and extract business URLs"""

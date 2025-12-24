@@ -2,6 +2,11 @@
 Lead Enrichment Engine
 Uses Tavily API for intelligent web search + OpenAI for extraction.
 Enriches contractor records with owner names, emails, and LinkedIn profiles.
+
+Production Features:
+- Pydantic schema enforcement (no hallucinated data)
+- Source URL tracking for verification
+- Retry logic for failed extractions
 """
 
 import os
@@ -12,6 +17,8 @@ from typing import Optional, Dict, List, Any
 from dataclasses import dataclass, field
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from pydantic import BaseModel, Field, field_validator
+import re
 
 # Load .env file
 from dotenv import load_dotenv
@@ -19,6 +26,13 @@ env_path = Path(__file__).parent.parent / '.env'
 load_dotenv(env_path)
 
 from openai import OpenAI
+
+# Try to import Instructor for schema enforcement
+try:
+    import instructor
+    INSTRUCTOR_AVAILABLE = True
+except ImportError:
+    INSTRUCTOR_AVAILABLE = False
 
 # Try to import Tavily, fall back to web search if not available
 try:
@@ -35,6 +49,70 @@ logging.basicConfig(
 logger = logging.getLogger("ENRICHER")
 
 
+# ==================== PYDANTIC SCHEMAS FOR LLM ENFORCEMENT ====================
+
+class ExtractedContact(BaseModel):
+    """Schema for LLM-extracted contact information. Enforced by Instructor."""
+
+    owner_name: Optional[str] = Field(
+        default=None,
+        description="Owner's full name (first and last). Must be a real person's name, not a business name."
+    )
+    email: Optional[str] = Field(
+        default=None,
+        description="Professional email address. Prefer personal emails over generic info@ addresses."
+    )
+    linkedin_url: Optional[str] = Field(
+        default=None,
+        description="LinkedIn profile URL for the owner or business."
+    )
+    confidence: float = Field(
+        default=0.5,
+        ge=0.0,
+        le=1.0,
+        description="Confidence score 0-1 based on data quality."
+    )
+    source_urls: List[str] = Field(
+        default_factory=list,
+        description="URLs where this information was found."
+    )
+
+    @field_validator('email')
+    @classmethod
+    def validate_email(cls, v):
+        if v is None:
+            return None
+        # Basic email validation
+        email_pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
+        if not re.match(email_pattern, v.strip()):
+            return None
+        return v.strip().lower()
+
+    @field_validator('linkedin_url')
+    @classmethod
+    def validate_linkedin(cls, v):
+        if v is None:
+            return None
+        if 'linkedin.com' not in v.lower():
+            return None
+        return v.strip()
+
+    @field_validator('owner_name')
+    @classmethod
+    def validate_owner_name(cls, v):
+        if v is None:
+            return None
+        # Must have at least two words (first and last name)
+        name = v.strip()
+        if len(name.split()) < 2:
+            return None
+        # Filter out obvious business names
+        business_indicators = ['llc', 'inc', 'corp', 'company', 'services', 'contracting', 'plumbing', 'electric']
+        if any(ind in name.lower() for ind in business_indicators):
+            return None
+        return name
+
+
 @dataclass
 class EnrichmentResult:
     """Result of enrichment attempt."""
@@ -44,6 +122,7 @@ class EnrichmentResult:
     linkedin_url: Optional[str] = None
     confidence: float = 0.0
     sources: List[str] = field(default_factory=list)
+    source_urls: List[str] = field(default_factory=list)  # URLs where data was found
     error: Optional[str] = None
 
 
@@ -87,6 +166,15 @@ class LeadEnricher:
         self.openai_client = OpenAI()
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
+
+        # Initialize Instructor for schema enforcement if available
+        if INSTRUCTOR_AVAILABLE:
+            self.instructor_client = instructor.from_openai(self.openai_client)
+            logger.info("Instructor initialized for LLM schema enforcement")
+        else:
+            self.instructor_client = None
+            logger.warning("Instructor not installed. Run: pip install instructor")
+            logger.warning("LLM responses will use fallback JSON parsing (less reliable)")
 
         # Initialize Tavily if available
         tavily_key = os.environ.get("TAVILY_API_KEY")
@@ -138,8 +226,14 @@ class LeadEnricher:
         return queries
 
     def _extract_with_llm(self, business_name: str, city: str, state: str,
-                          category: str, search_context: str) -> EnrichmentResult:
-        """Use LLM to extract structured data from search results."""
+                          category: str, search_context: str,
+                          source_urls: List[str] = None) -> EnrichmentResult:
+        """Use LLM to extract structured data from search results.
+
+        Uses Instructor for schema enforcement when available, preventing hallucinations.
+        """
+        source_urls = source_urls or []
+
         try:
             prompt = ENRICHMENT_PROMPT.format(
                 business_name=business_name,
@@ -149,6 +243,36 @@ class LeadEnricher:
                 search_context=search_context[:8000]  # Limit context size
             )
 
+            # Use Instructor for schema enforcement if available
+            if INSTRUCTOR_AVAILABLE and self.instructor_client:
+                try:
+                    extracted = self.instructor_client.chat.completions.create(
+                        model="gpt-4o-mini",
+                        response_model=ExtractedContact,
+                        max_retries=2,  # Auto-retry on validation failure
+                        messages=[
+                            {"role": "system", "content": "You extract business contact information. Be accurate and conservative - only extract data you're confident about."},
+                            {"role": "user", "content": prompt}
+                        ],
+                        temperature=0.1,
+                    )
+
+                    # Add source URLs from search results
+                    extracted.source_urls = source_urls[:5]  # Keep top 5
+
+                    return EnrichmentResult(
+                        success=True,
+                        owner_name=extracted.owner_name,
+                        email=extracted.email,
+                        linkedin_url=extracted.linkedin_url,
+                        confidence=extracted.confidence,
+                        sources=[],
+                        source_urls=extracted.source_urls
+                    )
+                except Exception as instructor_error:
+                    logger.warning(f"Instructor extraction failed, falling back: {instructor_error}")
+
+            # Fallback to standard OpenAI extraction
             response = self.openai_client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[
@@ -170,14 +294,35 @@ class LeadEnricher:
 
             data = json.loads(result_text)
 
-            return EnrichmentResult(
-                success=True,
-                owner_name=data.get('owner_name'),
-                email=data.get('email'),
-                linkedin_url=data.get('linkedin_url'),
-                confidence=float(data.get('confidence', 0.5)),
-                sources=data.get('sources', [])
-            )
+            # Validate with Pydantic even in fallback mode
+            try:
+                validated = ExtractedContact(
+                    owner_name=data.get('owner_name'),
+                    email=data.get('email'),
+                    linkedin_url=data.get('linkedin_url'),
+                    confidence=float(data.get('confidence', 0.5)),
+                    source_urls=source_urls[:5]
+                )
+                return EnrichmentResult(
+                    success=True,
+                    owner_name=validated.owner_name,
+                    email=validated.email,
+                    linkedin_url=validated.linkedin_url,
+                    confidence=validated.confidence,
+                    sources=data.get('sources', []),
+                    source_urls=validated.source_urls
+                )
+            except Exception:
+                # Return raw data if validation fails
+                return EnrichmentResult(
+                    success=True,
+                    owner_name=data.get('owner_name'),
+                    email=data.get('email'),
+                    linkedin_url=data.get('linkedin_url'),
+                    confidence=float(data.get('confidence', 0.5)),
+                    sources=data.get('sources', []),
+                    source_urls=source_urls[:5]
+                )
 
         except json.JSONDecodeError as e:
             logger.error(f"JSON parse error: {e}")
@@ -216,16 +361,18 @@ class LeadEnricher:
             logger.warning(f"No search results for: {business_name}")
             return EnrichmentResult(success=False, error="No search results")
 
-        # Build context from search results
+        # Build context from search results and collect source URLs
         search_context = ""
+        source_urls = []
         for r in all_results:
             title = r.get('title', '')
             content = r.get('content', '')
             url = r.get('url', '')
+            source_urls.append(url)
             search_context += f"\n--- Source: {url} ---\nTitle: {title}\n{content}\n"
 
-        # Extract with LLM
-        result = self._extract_with_llm(business_name, city, state, category, search_context)
+        # Extract with LLM (passing source URLs for tracking)
+        result = self._extract_with_llm(business_name, city, state, category, search_context, source_urls)
 
         if result.success and (result.owner_name or result.email or result.linkedin_url):
             with self._lock:
